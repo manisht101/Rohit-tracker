@@ -1,20 +1,20 @@
 """
-rohit_tracker.py  (v2 – RapidAPI + timezone-aware + fixed endpoints)
-=====================================================================
-Fixes applied vs v1:
-  • All datetime.utcnow() → datetime.now(UTC)  (no deprecation warnings)
-  • All datetime.utcfromtimestamp() → datetime.fromtimestamp(ts, UTC)
-  • RapidAPI endpoint paths corrected:
-      /matches/v1/live  →  /matches/v1/recent  (schedule)
-      /mcenter/v1/{id}/live  →  /mcenter/v1/{id}/comm  (scorecard)
-  • RAPIDAPI_KEY loaded safely with os.getenv (no KeyError if unset)
-  • Telegram Chat ID debug hint added to error log
+rohit_tracker.py  (v3 – adds two-way Telegram commands)
+=========================================================
+New in v3:
+  • TelegramListener runs in a background thread
+  • You can message the bot:
+      /next     – When is Rohit's/target team's next match?
+      /status   – Current bot state + live score (if tracking)
+      /help     – List available commands
+  • Everything from v2 (RapidAPI endpoints, timezone fixes) retained
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -105,11 +105,12 @@ class BotContext:
     state:        BotState            = BotState.SCHEDULE
     match_id:     str                 = ""
     match_start:  Optional[datetime]  = None
+    match_desc:   str                 = ""
     player_cache: PlayerCache         = field(default_factory=PlayerCache)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Telegram notification layer
+# Telegram notification layer (outgoing)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TelegramNotifier:
@@ -132,26 +133,191 @@ class TelegramNotifier:
             log.info("Telegram ✓ sent: %s", text[:80])
             return True
         except requests.RequestException as exc:
-            log.error(
-                "Telegram send failed (chat_id=%s): %s",
-                self._chat_id, exc
-            )
-            # Surface the response body so the cause is visible in the log
+            log.error("Telegram send failed (chat_id=%s): %s",
+                      self._chat_id, exc)
             if hasattr(exc, "response") and exc.response is not None:
                 log.error("Telegram response body: %s", exc.response.text)
             return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Data fetcher  –  RapidAPI Cricbuzz (corrected endpoint paths)
+# Telegram command listener (incoming) – v3
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TelegramListener:
+    """
+    Polls Telegram's getUpdates endpoint in a background thread and replies
+    to a small set of commands. Only responds to messages from
+    Config.TELEGRAM_CHAT_ID (your own chat) to avoid abuse.
+    """
+
+    def __init__(self, token: str, chat_id: str,
+                 fetcher: "CricbuzzFetcher", ctx: BotContext) -> None:
+        self._base    = f"https://api.telegram.org/bot{token}"
+        self._chat_id = str(chat_id)
+        self._fetcher = fetcher
+        self._ctx     = ctx
+        self._offset  = 0
+
+    # ── Public ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._skip_backlog()
+        t = threading.Thread(target=self._poll_loop, daemon=True,
+                             name="TelegramListener")
+        t.start()
+        log.info("[Listener] Telegram command listener started.")
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _skip_backlog(self) -> None:
+        """Advance the offset past any old/pending messages on startup."""
+        try:
+            resp = requests.get(f"{self._base}/getUpdates",
+                                params={"timeout": 0},
+                                timeout=Config.REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            results = resp.json().get("result", [])
+            if results:
+                self._offset = results[-1]["update_id"] + 1
+        except Exception as exc:
+            log.warning("[Listener] Could not skip backlog: %s", exc)
+
+    def _poll_loop(self) -> None:
+        while True:
+            try:
+                resp = requests.get(
+                    f"{self._base}/getUpdates",
+                    params={"offset": self._offset, "timeout": 30},
+                    timeout=35,
+                )
+                resp.raise_for_status()
+                for update in resp.json().get("result", []):
+                    self._offset = update["update_id"] + 1
+                    self._handle_update(update)
+            except (requests.ConnectionError, requests.Timeout):
+                time.sleep(3)
+            except Exception as exc:
+                log.warning("[Listener] poll error: %s", exc)
+                time.sleep(5)
+
+    def _handle_update(self, update: dict) -> None:
+        msg = update.get("message", {})
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        text = (msg.get("text") or "").strip()
+
+        if chat_id != self._chat_id:
+            log.info("[Listener] Ignoring message from unknown chat %s", chat_id)
+            return
+
+        cmd = text.lower()
+        log.info("[Listener] Received command: %s", text)
+
+        if cmd in ("/next", "/nextmatch", "next match", "when is the next match",
+                   "when is rohit's next match", "when is rohit next match"):
+            reply = self._next_match_reply()
+        elif cmd in ("/status", "/score", "status", "score"):
+            reply = self._status_reply()
+        elif cmd in ("/help", "/start", "help"):
+            reply = self._help_reply()
+        else:
+            reply = (
+                "🤔 I didn't understand that.\n\n" + self._help_reply()
+            )
+
+        self._send(reply)
+
+    def _send(self, text: str) -> None:
+        try:
+            requests.post(
+                f"{self._base}/sendMessage",
+                json={"chat_id": self._chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=Config.REQUEST_TIMEOUT,
+            )
+        except Exception as exc:
+            log.error("[Listener] reply send failed: %s", exc)
+
+    # ── Reply builders ───────────────────────────────────────────────────
+
+    def _next_match_reply(self) -> str:
+        # If we're already tracking/watching a match, show that first
+        ctx = self._ctx
+        if ctx.match_id and ctx.state != BotState.SCHEDULE:
+            when = (ctx.match_start.strftime("%d %b %Y, %I:%M %p UTC")
+                   if ctx.match_start else "in progress")
+            return (f"🏏 Currently tracking:\n"
+                   f"<b>{ctx.match_desc or 'Match'}</b>\n"
+                   f"🕒 {when}")
+
+        matches = self._fetcher.fetch_upcoming()
+        for m in matches:
+            team1 = m.get("team1", {}).get("teamName", "")
+            team2 = m.get("team2", {}).get("teamName", "")
+            if any(t.lower() in team1.lower() or t.lower() in team2.lower()
+                   for t in Config.TARGET_TEAMS):
+                start_ms = int(m.get("startDate", 0) or 0)
+                start_time = (datetime.fromtimestamp(start_ms / 1000, UTC)
+                              if start_ms else None)
+                when = (start_time.strftime("%d %b %Y, %I:%M %p UTC")
+                       if start_time else "TBD")
+                desc   = m.get("matchDesc", "")
+                series = m.get("seriesName", "")
+                return (f"📅 <b>Next match for {'/'.join(Config.TARGET_TEAMS)}:</b>\n"
+                       f"{team1} vs {team2}\n"
+                       f"{desc} — {series}\n"
+                       f"🕒 {when}")
+
+        return (f"I couldn't find any upcoming scheduled match for "
+               f"{'/'.join(Config.TARGET_TEAMS)} right now. "
+               f"Try again closer to the series dates.")
+
+    def _status_reply(self) -> str:
+        ctx = self._ctx
+        state_names = {
+            BotState.SCHEDULE: "💤 Waiting for next match (State 1)",
+            BotState.INNINGS:  "👀 Watching innings status (State 2)",
+            BotState.PRESENCE: f"⏳ Waiting for {Config.TARGET_PLAYER} to bat (State 3)",
+            BotState.TRACKING: f"🎯 Tracking {Config.TARGET_PLAYER} ball-by-ball (State 4)",
+        }
+        lines = [state_names.get(ctx.state, "Unknown state")]
+
+        if ctx.match_desc:
+            lines.append(f"\n🏟️ Match: {ctx.match_desc}")
+
+        if ctx.state in (BotState.PRESENCE, BotState.TRACKING):
+            pc = ctx.player_cache
+            strike_tag = "🎯 On strike" if pc.is_on_strike else "⏳ Non-striker"
+            lines.append(
+                f"\n🏏 {Config.TARGET_PLAYER}: {pc.runs} ({pc.balls} balls)"
+                f"\n4s: {pc.fours} | 6s: {pc.sixes}"
+                f"\n{strike_tag}"
+            )
+
+        return "\n".join(lines)
+
+    def _help_reply(self) -> str:
+        return (
+            "🏏 <b>Rohit Tracker — Commands</b>\n\n"
+            "/next — When is the next match?\n"
+            "/status — Current tracking status & live score\n"
+            "/help — Show this message\n\n"
+            "Alerts (strike, fours, sixes, wickets) are sent automatically."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Data fetcher  –  RapidAPI Cricbuzz
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CricbuzzFetcher:
     """
     Uses the RapidAPI Cricbuzz wrapper.
     Endpoint reference (RapidAPI):
-      GET /matches/v1/recent          – fixture list incl. live matches
-      GET /mcenter/v1/{matchId}/comm  – live scorecard / commentary
+      GET /matches/v1/live      – currently live matches
+      GET /matches/v1/recent    – recently finished matches
+      GET /matches/v1/upcoming  – upcoming scheduled matches
+      GET /mcenter/v1/{id}/comm – live scorecard / commentary
+      GET /mcenter/v1/{id}/score – fallback scorecard
     """
 
     _BASE = "https://cricbuzz-cricket.p.rapidapi.com"
@@ -188,22 +354,27 @@ class CricbuzzFetcher:
 
         raise RuntimeError(f"All {Config.MAX_RETRIES} retries failed for {url}")
 
+    @staticmethod
+    def _extract_matches(data: dict) -> list[dict]:
+        matches = []
+        for type_block in data.get("typeMatches", []):
+            for series_block in type_block.get("seriesMatches", []):
+                wrapper = series_block.get("seriesAdWrapper", {})
+                for m in wrapper.get("matches", []):
+                    info = m.get("matchInfo", {})
+                    # Stash the series name for nicer display
+                    info["seriesName"] = wrapper.get("seriesName", "")
+                    matches.append(info)
+        return matches
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def fetch_schedule(self) -> list[dict]:
-        """
-        Fetch live + recent matches from RapidAPI.
-        Tries /matches/v1/live first; falls back to /matches/v1/recent.
-        """
+        """Live matches first, falling back to recent."""
         for endpoint in ("/matches/v1/live", "/matches/v1/recent"):
             try:
                 data = self._raw_get(endpoint)
-                matches = []
-                for type_block in data.get("typeMatches", []):
-                    for series_block in type_block.get("seriesMatches", []):
-                        wrapper = series_block.get("seriesAdWrapper", {})
-                        for m in wrapper.get("matches", []):
-                            matches.append(m.get("matchInfo", {}))
+                matches = self._extract_matches(data)
                 if matches:
                     log.info("fetch_schedule: got %d matches from %s",
                              len(matches), endpoint)
@@ -213,11 +384,21 @@ class CricbuzzFetcher:
                             endpoint, exc)
         return []
 
+    def fetch_upcoming(self) -> list[dict]:
+        """Upcoming scheduled matches (for /next command)."""
+        try:
+            data = self._raw_get("/matches/v1/upcoming")
+            matches = self._extract_matches(data)
+            # Sort by start date ascending
+            matches.sort(key=lambda m: int(m.get("startDate", 0) or 0))
+            log.info("fetch_upcoming: got %d matches", len(matches))
+            return matches
+        except Exception as exc:
+            log.warning("fetch_upcoming failed: %s", exc)
+            return []
+
     def fetch_match_data(self, match_id: str) -> dict:
-        """
-        Live scorecard via RapidAPI.
-        Tries /comm (commentary+scorecard) then /score as fallback.
-        """
+        """Live scorecard via RapidAPI, with fallback path."""
         for path in (f"/mcenter/v1/{match_id}/comm",
                      f"/mcenter/v1/{match_id}/score"):
             try:
@@ -235,6 +416,7 @@ class CricbuzzFetcher:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _team_playing_today(matches: list[dict], target_teams: tuple) -> Optional[dict]:
+    from datetime import timedelta
     today = datetime.now(UTC).date()
     for m in matches:
         team1    = m.get("team1", {}).get("teamName", "")
@@ -245,12 +427,8 @@ def _team_playing_today(matches: list[dict], target_teams: tuple) -> Optional[di
             if start_ms else None
         )
 
-        # Accept matches that started today OR are live (no date filter needed)
-        if match_date and match_date not in (today,):
-            # also allow yesterday-started matches still live (day-night tests)
-            from datetime import timedelta
-            if match_date < today - timedelta(days=1):
-                continue
+        if match_date and match_date < today - timedelta(days=1):
+            continue
 
         if any(t.lower() in team1.lower() or t.lower() in team2.lower()
                for t in target_teams):
@@ -262,19 +440,16 @@ def _team_playing_today(matches: list[dict], target_teams: tuple) -> Optional[di
 
 def _is_batting(live_data: dict, target_teams: tuple) -> bool:
     try:
-        # RapidAPI /comm response shape
         score_card = live_data.get("scoreCard", [])
         if score_card:
-            # Last innings entry is the current one
-            current = score_card[-1]
-            bat_team_name = (
-                current.get("batTeamDetails", {})
-                       .get("batTeamName", "")
-            )
-            return any(t.lower() in bat_team_name.lower()
-                       for t in target_teams)
+            for innings in score_card:
+                bat_team_name = (
+                    innings.get("batTeamDetails", {})
+                           .get("batTeamName", "")
+                )
+                if any(t.lower() in bat_team_name.lower() for t in target_teams):
+                    return True
 
-        # Fallback: miniscore shape (older endpoint)
         batting_team = (
             live_data.get("miniscore", {})
                      .get("batTeam", {})
@@ -283,14 +458,14 @@ def _is_batting(live_data: dict, target_teams: tuple) -> bool:
             or live_data.get("miniscore", {}).get("battingTeam", "")
         )
         return any(t.lower() in batting_team.lower() for t in target_teams)
-    except Exception:
+    except Exception as e:
+        log.debug("_is_batting error: %s", e)
         return False
 
 
 def _find_player(live_data: dict, player_name: str) -> Optional[dict]:
     needle = player_name.lower()
     try:
-        # RapidAPI /comm shape: scoreCard[].batTeamDetails.batsmenData
         for innings in live_data.get("scoreCard", []):
             batsmen_data: dict = (
                 innings.get("batTeamDetails", {})
@@ -299,20 +474,18 @@ def _find_player(live_data: dict, player_name: str) -> Optional[dict]:
             for batter in batsmen_data.values():
                 name = batter.get("batName", "").lower()
                 if needle in name and batter.get("outDesc", "") == "":
-                    # outDesc empty → still batting
                     return {
-                        "name":       batter.get("batName"),
-                        "runs":       batter.get("runs", 0),
-                        "balls":      batter.get("balls", 0),
-                        "fours":      batter.get("fours", 0),
-                        "sixes":      batter.get("sixes", 0),
-                        "isStriker":  batter.get("isStriker", False),
+                        "name":      batter.get("batName"),
+                        "runs":      batter.get("runs", 0),
+                        "balls":     batter.get("balls", 0),
+                        "fours":     batter.get("fours", 0),
+                        "sixes":     batter.get("sixes", 0),
+                        "isStriker": batter.get("isStriker", False),
                     }
     except Exception as exc:
         log.debug("_find_player (scoreCard path) error: %s", exc)
 
     try:
-        # Fallback: miniscore shape
         batsmen: list = (
             live_data.get("miniscore", {})
                      .get("batTeam", {})
@@ -355,6 +528,11 @@ def handle_schedule(ctx: BotContext, fetcher: CricbuzzFetcher,
 
     ctx.match_id    = match_id
     ctx.match_start = start_time
+    ctx.match_desc  = (
+        f"{target_match.get('team1', {}).get('teamName','')} vs "
+        f"{target_match.get('team2', {}).get('teamName','')} "
+        f"({target_match.get('matchDesc','')})"
+    )
 
     wait_seconds = max(0.0, (start_time - datetime.now(UTC)).total_seconds())
     if wait_seconds > 60:
@@ -380,8 +558,9 @@ def handle_innings(ctx: BotContext, fetcher: CricbuzzFetcher,
     )
     if "complete" in match_state or "result" in match_state:
         log.info("[State 2] Match finished. Returning to State 1.")
-        ctx.match_id = ""
-        ctx.state    = BotState.SCHEDULE
+        ctx.match_id   = ""
+        ctx.match_desc = ""
+        ctx.state      = BotState.SCHEDULE
         return
 
     if _is_batting(live, Config.TARGET_TEAMS):
@@ -514,7 +693,7 @@ _STATE_HANDLERS = {
 
 def main() -> None:
     log.info("═" * 60)
-    log.info("  Rohit Sharma Cricket Tracker  v2")
+    log.info("  Rohit Sharma Cricket Tracker  v3")
     log.info("  Watching: %s", ", ".join(Config.TARGET_TEAMS))
     log.info("  Chat ID : %s", Config.TELEGRAM_CHAT_ID)
     log.info("═" * 60)
@@ -523,9 +702,16 @@ def main() -> None:
     fetcher  = CricbuzzFetcher()
     ctx      = BotContext()
 
+    # Start the two-way command listener in the background
+    listener = TelegramListener(Config.TELEGRAM_BOT_TOKEN,
+                                Config.TELEGRAM_CHAT_ID,
+                                fetcher, ctx)
+    listener.start()
+
     notifier.send(
-        "🏏 <b>Rohit Tracker v2 is now running.</b>\n"
-        f"Monitoring: {', '.join(Config.TARGET_TEAMS)}"
+        "🏏 <b>Rohit Tracker v3 is now running.</b>\n"
+        f"Monitoring: {', '.join(Config.TARGET_TEAMS)}\n\n"
+        "Send /help to see available commands."
     )
 
     while True:
